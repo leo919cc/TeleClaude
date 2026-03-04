@@ -15,7 +15,7 @@ from telegram.request import HTTPXRequest
 
 from claude_runner import ClaudeRunner
 from config import ALLOWED_BASE, TELEGRAM_BOT_TOKEN, allowed_user_ids, validate
-from skills import SKILLS, get_skill_prompt, list_skills
+from skills import CLI_ONLY, SKILLS, get_skill_prompt, list_skills
 from utils import split_message
 
 logging.basicConfig(
@@ -121,6 +121,16 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Skill commands ---
 
 @auth_check
+async def cmd_cli_only(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reply when someone tries to use a CLI-only command via Telegram."""
+    command = update.message.text.split()[0].lstrip("/").split("@")[0]
+    desc = CLI_ONLY.get(command, "")
+    await update.message.reply_text(
+        f"/{command} is only available in the Claude Code terminal.\n\n{desc}"
+    )
+
+
+@auth_check
 async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(list_skills())
 
@@ -220,6 +230,8 @@ def main():
     app.add_handler(CommandHandler("skills", cmd_skills))
     for skill_name in SKILLS:
         app.add_handler(CommandHandler(skill_name, cmd_skill))
+    for cli_name in CLI_ONLY:
+        app.add_handler(CommandHandler(cli_name, cmd_cli_only))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Register command menu with Telegram (max 100 commands)
@@ -233,6 +245,9 @@ def main():
         # Add all skills to command menu
         for name, info in SKILLS.items():
             commands.append(BotCommand(name, info["description"][:256]))
+        # Add CLI-only commands (flagged)
+        for name, desc in CLI_ONLY.items():
+            commands.append(BotCommand(name, desc[:256]))
         commands.append(BotCommand("skills", "List all skills"))
         commands.append(BotCommand("help", "Show help"))
         await application.bot.set_my_commands(commands)

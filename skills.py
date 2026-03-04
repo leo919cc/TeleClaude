@@ -1,157 +1,31 @@
-"""Skill definitions — maps Telegram commands to Claude Code skill prompts."""
+"""Skill auto-discovery — loads all Claude Code skills/commands at startup."""
 
 import os
+import re
+from pathlib import Path
 
-SKILLS = {
-    # --- Session management ---
-    "sync": {
-        "description": "Pull latest, check tasks & git status",
-        "needs_project": True,
-        "prompt": """Session start sync. Run these steps in order:
+CLAUDE_DIR = Path.home() / ".claude"
 
-1. Run `git pull`. If not a git repo, skip.
-2. Read `tasks/todo.md` if it exists — summarize what's done, in progress, blocked.
-3. Read `tasks/lessons.md` if it exists — note past mistakes.
-4. Run `git log --oneline -10` and `git status`.
-5. Report: current branch, recent commits, open tasks, lessons, any WIP work.""",
-    },
-    "wrap": {
-        "description": "Commit, push, update tasks",
-        "needs_project": True,
-        "prompt": """End-of-session wrap-up. Run these steps in order:
+# Telegram bot commands: 1-32 chars, lowercase a-z, 0-9, underscore only
+_VALID_CMD = re.compile(r"^[a-z0-9_]{1,32}$")
 
-1. Run `git status` and `git diff --stat` to see all changes.
-2. Commit changes: if complete, use a clear message. If incomplete, use `wip:` prefix. Stage selectively — never `git add .`. Never commit secrets or .env files.
-3. Push to remote. If no upstream, set it with `git push -u origin <branch>`.
-4. Read and update `tasks/todo.md`: mark completed items, note in-progress and blocked.
-5. Report: commits pushed, task status changes, anything left for next session.""",
-    },
-    # --- Git commands ---
-    "commit": {
-        "description": "Create a git commit",
-        "needs_project": True,
-        "prompt": """Check `git status`, `git diff HEAD`, `git branch --show-current`, and `git log --oneline -10`.
-Based on the changes, stage relevant files and create a single git commit with an appropriate message. Never commit secrets or .env files.""",
-    },
-    "commitpr": {
-        "description": "Commit, push, and open a PR",
-        "needs_project": True,
-        "prompt": """Check `git status`, `git diff HEAD`, and `git branch --show-current`.
-Based on the changes:
-1. Create a new branch if on main.
-2. Stage and commit with an appropriate message.
-3. Push the branch to origin.
-4. Create a pull request using `gh pr create`.""",
-    },
-    # --- Code review ---
-    "review": {
-        "description": "Self-review recent code changes",
-        "needs_project": True,
-        "prompt": """Review recent code changes:
-
-1. Check uncommitted changes with `git diff` and `git diff --cached`. If none, review last commit with `git diff HEAD~1`.
-2. Read every changed file in full.
-3. Check for: logic errors, security issues (hardcoded secrets, injection), type safety, race conditions, dead code, over-engineering.
-4. Report findings grouped by severity (critical > high > medium > low). For each: file, line, issue, fix. If no issues, say so.""",
-    },
-    "codex": {
-        "description": "Cross-model code review via Codex",
-        "needs_project": True,
-        "prompt": """Cross-model code review using PAL codereview with gpt-5.1-codex. Max 3 rounds.
-
-1. Identify changed files: uncommitted changes or last commit.
-2. Read every changed file in full.
-3. Run the project's type checker if applicable (tsc, pyright, go build).
-4. Call mcp__pal__codereview with review_type "full", the changed file paths, context of what changed, and your preliminary assessment. Scope: logic bugs, edge cases, type safety, race conditions, security. Exclude: style, formatting, naming.
-5. For each finding: fix if you agree, reject with reasoning if you disagree.
-6. Re-review if fixes were made (max 3 rounds).
-7. Report: total rounds, issues found/fixed/rejected/deferred.""",
-    },
-    "codereview": {
-        "description": "Review a pull request",
-        "needs_project": True,
-        "prompt": """Review the current pull request:
-
-1. Check if a PR exists: `gh pr view`. If not, report and stop.
-2. Get the PR diff: `gh pr diff`.
-3. Read the changed files in full.
-4. Check for: bugs, CLAUDE.md compliance, security issues, error handling, test coverage.
-5. Post a comment on the PR with findings using `gh pr comment`. Format: list issues with file:line references, grouped by severity. If no issues, say so.""",
-    },
-    "reviewpr": {
-        "description": "Comprehensive PR review with multiple checks",
-        "needs_project": True,
-        "prompt": """Comprehensive PR review. Check git diff for changed files.
-
-Review for these aspects:
-1. Code quality — CLAUDE.md compliance, bugs, patterns
-2. Error handling — silent failures, missing catch blocks
-3. Test coverage — are changes tested?
-4. Simplicity — over-engineering, dead code, unnecessary complexity
-
-Report findings grouped as:
-- Critical Issues (must fix before merge)
-- Important Issues (should fix)
-- Suggestions (nice to have)
-- Strengths (what's well-done)
-
-Include file:line references for each finding.""",
-    },
-    # --- Planning & development ---
-    "plan": {
-        "description": "Create or update task plan",
-        "needs_project": True,
-        "prompt_with_args": True,
-        "prompt": """Create a structured task plan in `tasks/todo.md`.
-
-1. Explore the codebase to understand what exists.
-2. Break the work into concrete steps, ordered by dependency.
-3. Write the plan to `tasks/todo.md` (create `tasks/` dir if needed). If it already exists, update rather than overwrite.
-4. Use format: Context section, Plan with checkboxes, Notes with trade-offs.
-5. Present the plan for confirmation.""",
-    },
-    "feature": {
-        "description": "Guided feature development",
-        "needs_project": True,
-        "prompt_with_args": True,
-        "prompt": """Guided feature development:
-
-1. Explore the codebase to understand relevant patterns and architecture.
-2. Identify all ambiguities and edge cases — list clarifying questions.
-3. Design an implementation approach: minimal changes, clean architecture, trade-offs.
-4. Present the approach and wait for confirmation before implementing.
-5. Implement following codebase conventions.
-6. Self-review for simplicity, bugs, and correctness.
-7. Summarize: what was built, files modified, key decisions, next steps.""",
-    },
-    # --- Utilities ---
-    "revise": {
-        "description": "Update CLAUDE.md with session learnings",
-        "needs_project": True,
-        "prompt": """Review this session for learnings about working in this codebase. Update CLAUDE.md with useful context for future sessions.
-
-1. Reflect: what commands, patterns, quirks, or gotchas were discovered?
-2. Find CLAUDE.md files in the project.
-3. Draft concise additions (one line per concept). Avoid verbose explanations.
-4. Show proposed changes as diffs.
-5. Apply the changes.""",
-    },
-    "backup": {
-        "description": "Backup Claude settings to GitHub",
-        "needs_project": False,
-        "prompt": """Run the Claude global settings backup script:
-
-```bash
-bash ~/Documents/claude-global-backup/sync.sh
-```
-
-Report whether files were changed and pushed, or already up to date.""",
-    },
-    "note": {
-        "description": "Save ideas to Notion",
-        "needs_project": False,
-    },
+# Built-in CLI commands that don't work through claude -p
+CLI_ONLY = {
+    "login": "Authenticate Claude Code (CLI only)",
+    "logout": "Sign out of Claude Code (CLI only)",
+    "doctor": "Diagnose Claude Code issues (CLI only)",
+    "compact": "Compress conversation context (CLI only)",
+    "config": "View/edit Claude Code config (CLI only)",
+    "model": "Switch AI model (CLI only)",
+    "cost": "Show session costs (CLI only)",
+    "permissions": "Manage tool permissions (CLI only)",
+    "mcp": "Manage MCP servers (CLI only)",
+    "init": "Initialize project settings (CLI only)",
+    "vim": "Toggle vim mode (CLI only)",
 }
+
+# Custom prompt overrides for skills that need special handling
+PROMPT_OVERRIDES = {}
 
 
 def _note_prompt(args: str) -> str:
@@ -174,12 +48,117 @@ Idea to capture: {args}
 Format the page with: title, date, summary bullets, and action items if applicable. Confirm the page URL when done."""
 
 
+PROMPT_OVERRIDES["note"] = _note_prompt
+
+
+def _parse_frontmatter(text: str) -> tuple[dict, str]:
+    """Parse YAML frontmatter and return (metadata, body)."""
+    if not text.startswith("---"):
+        return {}, text
+
+    end = text.find("---", 3)
+    if end == -1:
+        return {}, text
+
+    fm = text[3:end].strip()
+    body = text[end + 3:].strip()
+    meta = {}
+    for line in fm.split("\n"):
+        if ":" in line:
+            key, _, val = line.partition(":")
+            meta[key.strip()] = val.strip().strip('"').strip("'")
+    return meta, body
+
+
+def _normalize_cmd(name: str) -> str | None:
+    """Normalize a command name for Telegram (lowercase, underscores, 1-32 chars)."""
+    name = name.lower().replace("-", "_")
+    return name if _VALID_CMD.match(name) else None
+
+
+def _discover_skills() -> dict:
+    """Auto-discover all skills and commands from ~/.claude/."""
+    skills = {}
+
+    # 1. Custom skills: ~/.claude/skills/*/SKILL.md
+    skills_dir = CLAUDE_DIR / "skills"
+    if skills_dir.is_dir():
+        for skill_dir in sorted(skills_dir.iterdir()):
+            skill_file = skill_dir / "SKILL.md"
+            if skill_file.is_file():
+                text = skill_file.read_text()
+                meta, body = _parse_frontmatter(text)
+                raw_name = meta.get("name", skill_dir.name)
+                name = _normalize_cmd(raw_name)
+                if not name:
+                    continue
+                desc = meta.get("description", f"Run {name} skill")
+                needs_project = "Bash" in meta.get("allowed-tools", "")
+                skills[name] = {
+                    "description": desc,
+                    "needs_project": needs_project,
+                    "prompt": body,
+                    "source": str(skill_file),
+                }
+
+    # 2. Custom commands: ~/.claude/commands/*.md
+    cmds_dir = CLAUDE_DIR / "commands"
+    if cmds_dir.is_dir():
+        for cmd_file in sorted(cmds_dir.glob("*.md")):
+            text = cmd_file.read_text()
+            meta, body = _parse_frontmatter(text)
+            name = _normalize_cmd(cmd_file.stem)
+            if not name:
+                continue
+            desc = meta.get("description", body.split("\n")[0][:100])
+            skills[name] = {
+                "description": desc,
+                "needs_project": False,
+                "prompt": body,
+                "source": str(cmd_file),
+            }
+
+    # 3. Plugin commands: ~/.claude/plugins/**/commands/*.md
+    plugins_dir = CLAUDE_DIR / "plugins"
+    if plugins_dir.is_dir():
+        for cmd_file in sorted(plugins_dir.rglob("commands/*.md")):
+            text = cmd_file.read_text()
+            meta, body = _parse_frontmatter(text)
+            name = _normalize_cmd(cmd_file.stem)
+            if not name:
+                continue
+            # Skip if name conflicts with a custom skill (custom takes priority)
+            if name in skills:
+                continue
+            # Skip generic help files
+            if name == "help":
+                continue
+            desc = meta.get("description", f"Run {name}")
+            skills[name] = {
+                "description": desc,
+                "needs_project": True,
+                "prompt": body,
+                "source": str(cmd_file),
+            }
+
+    return skills
+
+
+# Load at import time
+SKILLS = _discover_skills()
+
+
 def get_skill_prompt(name: str, args: str = "") -> str | None:
+    if name in CLI_ONLY:
+        return None
+
+    # Check for custom prompt override (e.g. note)
+    if name in PROMPT_OVERRIDES:
+        return PROMPT_OVERRIDES[name](args or "")
+
     skill = SKILLS.get(name)
     if not skill:
         return None
-    if name == "note":
-        return _note_prompt(args or "general ideas from this conversation")
     prompt = skill["prompt"]
     if args:
         return f"{prompt}\n\nTask: {args}"
@@ -187,7 +166,10 @@ def get_skill_prompt(name: str, args: str = "") -> str | None:
 
 
 def list_skills() -> str:
-    lines = ["Available skills:\n"]
+    lines = ["Skills (run via Telegram):\n"]
     for name, info in SKILLS.items():
         lines.append(f"  /{name} — {info['description']}")
+    lines.append("\nCLI only (use in terminal):\n")
+    for name, desc in CLI_ONLY.items():
+        lines.append(f"  /{name} — {desc}")
     return "\n".join(lines)
