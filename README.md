@@ -21,32 +21,69 @@ Phone/Laptop → Telegram → Bot API → bot.py (your machine) → claude -p �
 - **User whitelist** — only responds to authorized Telegram user IDs
 - **Auto-restart** — LaunchAgent restarts the bot on crash or reboot (macOS)
 
+## Prerequisites
+
+- **Python 3.10+**
+- **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/overview)** installed and authenticated (`claude` command must work in your terminal)
+- **Telegram account**
+
 ## Setup
 
-1. Create a bot via [@BotFather](https://t.me/BotFather) and get the token
-2. Get your Telegram user ID (message [@userinfobot](https://t.me/userinfobot))
-3. Install [Claude Code](https://claude.com/claude-code) CLI
+### 1. Create a Telegram bot
+
+1. Open Telegram and search for [@BotFather](https://t.me/BotFather)
+2. Send `/newbot` and follow the prompts to choose a name and username
+3. BotFather will reply with your **bot token** — save it (looks like `123456789:ABCdefGHIjklMNOpqrsTUVwxyz`)
+
+### 2. Get your Telegram user ID
+
+1. Search for [@userinfobot](https://t.me/userinfobot) on Telegram
+2. Send it any message — it will reply with your **user ID** (a number like `123456789`)
+3. This is used to restrict the bot to only respond to you
+
+### 3. Clone and configure
 
 ```bash
 git clone https://github.com/leo919pm/claude-tg-bridge.git
 cd claude-tg-bridge
 cp .env.example .env
-# Edit .env with your bot token and user ID
 ```
 
-### Run manually
+Edit `.env` with your values:
+
+```
+TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
+TELEGRAM_USER_ID=123456789
+```
+
+To allow multiple users, separate IDs with commas: `TELEGRAM_USER_ID=111,222,333`
+
+### 4. Install and run
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 python3 bot.py
 ```
 
-### Run as macOS LaunchAgent (auto-start on boot)
+Open your bot in Telegram and send a message — you should get a response from Claude.
+
+### 5. (Optional) Auto-start on macOS
+
+To run the bot automatically on boot and restart on crash:
 
 ```bash
 ./install.sh
 ```
+
+This creates a macOS LaunchAgent and a service copy outside `~/Documents/` (to avoid macOS privacy restrictions). The bot will start on login and show a dialog if it crashes.
+
+To stop: `launchctl unload ~/Library/LaunchAgents/com.$(whoami).claude-tg-bridge.plist`
+
+To start again: `launchctl load ~/Library/LaunchAgents/com.$(whoami).claude-tg-bridge.plist`
+
+Or double-click `start.command` to run manually from Finder.
 
 ## Commands
 
