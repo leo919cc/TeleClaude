@@ -6,7 +6,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+# Centralized API keys first, then project-local for overrides
+load_dotenv(Path.home() / "Documents" / "api-keys" / ".env")
+load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_USER_ID = os.getenv("TELEGRAM_USER_ID")
