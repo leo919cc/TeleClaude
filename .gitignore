@@ -5,5 +5,6 @@ __pycache__/
 .DS_Store
 logs/
 scheduled_jobs.json
+sessions.db
 CLAUDE.md
 tasks/

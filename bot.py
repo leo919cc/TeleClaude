@@ -106,10 +106,9 @@ async def send_detected_files(message, files: list[Path]):
 # --- Streaming ---
 
 class StreamingMessage:
-    """Progressive Telegram message updates during Claude streaming."""
+    """Handles streaming responses — shows partial results as they arrive from multi-turn runs."""
 
-    INTERVAL = 1.5  # seconds between edits
-    MAX_CHUNK = 4000  # leave room for cursor/formatting
+    MAX_CHUNK = 4000
 
     def __init__(self, chat_id: int, bot):
         self.chat_id = chat_id
@@ -119,7 +118,7 @@ class StreamingMessage:
         self.last_edit = 0.0
 
     async def update(self, full_text: str):
-        """Called with accumulated text. Edits the Telegram message at most every INTERVAL."""
+        """Called with accumulated text. Updates Telegram message at most every 2s."""
         current = full_text[self.sent_len:]
         if not current.strip():
             return
@@ -127,38 +126,52 @@ class StreamingMessage:
         now = time.time()
 
         if self.msg is None:
-            self.msg = await self.bot.send_message(self.chat_id, current[:self.MAX_CHUNK] + " ...")
+            self.msg = await self.bot.send_message(
+                self.chat_id, current[:self.MAX_CHUNK] + " ..."
+            )
             self.last_edit = now
             return
 
-        # Split if current chunk is too long
+        # Split if too long
         if len(current) > self.MAX_CHUNK:
-            seal_point = current.rfind("\n", 0, self.MAX_CHUNK)
-            if seal_point < self.MAX_CHUNK // 2:
-                seal_point = self.MAX_CHUNK
+            seal = current.rfind("\n", 0, self.MAX_CHUNK)
+            if seal < self.MAX_CHUNK // 2:
+                seal = self.MAX_CHUNK
             try:
-                await self.msg.edit_text(current[:seal_point])
+                await self.msg.edit_text(current[:seal])
             except (BadRequest, RetryAfter):
                 pass
-            self.sent_len += seal_point
-            remainder = current[seal_point:]
+            self.sent_len += seal
+            remainder = current[seal:]
             self.msg = await self.bot.send_message(self.chat_id, remainder + " ...")
             self.last_edit = now
             return
 
-        if now - self.last_edit < self.INTERVAL:
+        if now - self.last_edit < 2.0:
             return
 
         try:
             await self.msg.edit_text(current + " ...")
             self.last_edit = now
         except BadRequest:
-            pass  # message not modified
+            pass
         except RetryAfter as e:
             await asyncio.sleep(e.retry_after)
 
+    async def show_status(self, status: str):
+        """Show a tool/activity status line in the message."""
+        if self.msg is None:
+            self.msg = await self.bot.send_message(self.chat_id, status)
+            self.last_edit = time.time()
+        else:
+            try:
+                await self.msg.edit_text(status)
+                self.last_edit = time.time()
+            except BadRequest:
+                pass
+
     async def finalize(self, full_text: str, footer: str = ""):
-        """Replace last message with HTML-formatted version + footer."""
+        """Final edit with HTML formatting + footer."""
         current = full_text[self.sent_len:]
         formatted = markdown_to_tg_html(current + footer)
         chunks = split_message(formatted)
@@ -172,7 +185,6 @@ class StreamingMessage:
                     await self.bot.send_message(self.chat_id, plain)
             return
 
-        # Edit current message with first chunk
         try:
             await self.msg.edit_text(chunks[0], parse_mode="HTML")
         except Exception:
@@ -182,13 +194,64 @@ class StreamingMessage:
             except Exception:
                 pass
 
-        # Send remaining chunks as new messages
         for chunk in chunks[1:]:
             try:
                 await self.bot.send_message(self.chat_id, chunk, parse_mode="HTML")
             except Exception:
                 plain = html.unescape(re.sub(r"<[^>]+>", "", chunk))
                 await self.bot.send_message(self.chat_id, plain)
+
+
+# --- Typing indicator ---
+
+class TypingIndicator:
+    """Keep Telegram's 'typing...' bubble visible for the entire processing duration."""
+
+    def __init__(self, bot, chat_id: int):
+        self.bot = bot
+        self.chat_id = chat_id
+        self._task = None
+
+    async def __aenter__(self):
+        self._task = asyncio.create_task(self._loop())
+        return self
+
+    async def __aexit__(self, *args):
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+
+    async def _loop(self):
+        while True:
+            try:
+                await self.bot.send_chat_action(self.chat_id, "typing")
+            except Exception:
+                pass
+            await asyncio.sleep(5)
+
+
+# --- Tool status ---
+
+def _tool_status(name: str, input_data: dict) -> str:
+    """Format a tool_use event into a short status line."""
+    if name == "Read":
+        path = input_data.get("file_path", "")
+        return f"Reading {Path(path).name}" if path else "Reading..."
+    if name == "Bash":
+        cmd = input_data.get("command", "")[:50]
+        return f"$ {cmd}" if cmd else "Running command..."
+    if name in ("Edit", "Write"):
+        path = input_data.get("file_path", "")
+        return f"Editing {Path(path).name}" if path else "Editing..."
+    if name == "Glob":
+        return f"Search: {input_data.get('pattern', '...')}"
+    if name == "Grep":
+        return f"Grep: {input_data.get('pattern', '...')}"
+    if name == "WebSearch":
+        return f"Searching: {input_data.get('query', '...')[:40]}"
+    return f"{name}..."
 
 
 # --- Voice ---
@@ -477,9 +540,9 @@ async def cmd_skill(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     prompt = get_skill_prompt(command, args)
-    await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
-    result = await runner.run(update.effective_user.id, prompt)
+    async with TypingIndicator(context.bot, update.effective_chat.id):
+        result = await runner.run(update.effective_user.id, prompt)
     await _send_result(update, result)
 
 
@@ -491,10 +554,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not prompt:
         return
 
-    await context.bot.send_chat_action(update.effective_chat.id, "typing")
-
     streamer = StreamingMessage(update.effective_chat.id, context.bot)
-    result = await runner.run_streaming(update.effective_user.id, prompt, streamer.update)
+
+    async def on_tool(name, input_data):
+        await streamer.show_status(_tool_status(name, input_data))
+
+    async with TypingIndicator(context.bot, update.effective_chat.id):
+        result = await runner.run_streaming(
+            update.effective_user.id, prompt, streamer.update, on_tool
+        )
     await _send_streaming_result(update, streamer, result)
 
 
@@ -531,11 +599,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{caption}"
     )
 
-    await context.bot.send_chat_action(update.effective_chat.id, "typing")
-    result = await runner.run(update.effective_user.id, prompt)
+    async with TypingIndicator(context.bot, update.effective_chat.id):
+        result = await runner.run(update.effective_user.id, prompt)
     await _send_result(update, result)
 
-    # Clean up
     path.unlink(missing_ok=True)
 
 
@@ -561,8 +628,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{caption}"
     )
 
-    await context.bot.send_chat_action(update.effective_chat.id, "typing")
-    result = await runner.run(update.effective_user.id, prompt)
+    async with TypingIndicator(context.bot, update.effective_chat.id):
+        result = await runner.run(update.effective_user.id, prompt)
     await _send_result(update, result)
 
     path.unlink(missing_ok=True)
@@ -596,10 +663,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         path.unlink(missing_ok=True)
 
-    await update.message.reply_text(f"Transcription: {text}")
-
     streamer = StreamingMessage(update.effective_chat.id, context.bot)
-    result = await runner.run_streaming(update.effective_user.id, text, streamer.update)
+
+    async def on_tool(name, input_data):
+        await streamer.show_status(_tool_status(name, input_data))
+
+    async with TypingIndicator(context.bot, update.effective_chat.id):
+        result = await runner.run_streaming(
+            update.effective_user.id, text, streamer.update, on_tool
+        )
     await _send_streaming_result(update, streamer, result)
 
 

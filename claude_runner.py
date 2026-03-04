@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import db
 from config import CLAUDE_PATH, CLAUDE_TIMEOUT
 
 MEDIA_DIR = Path(tempfile.gettempdir()) / "claude-tg-media"
@@ -43,16 +44,30 @@ class ClaudeRunner:
 
     def get_session(self, user_id: int) -> Session:
         if user_id not in self.sessions:
-            self.sessions[user_id] = Session()
+            data = db.load_session(user_id)
+            if data:
+                self.sessions[user_id] = Session(
+                    project_dir=Path(data["project_dir"]) if data["project_dir"] else None,
+                    session_id=data["session_id"],
+                    model=data["model"],
+                    permission_mode=data["permission_mode"],
+                    total_cost=data["total_cost"],
+                    total_duration=data["total_duration"],
+                    message_count=data["message_count"],
+                )
+            else:
+                self.sessions[user_id] = Session()
         return self.sessions[user_id]
 
     def clear_session(self, user_id: int) -> None:
         self.sessions[user_id] = Session()
+        db.delete_session(user_id)
 
     def set_project(self, user_id: int, project_dir: Path) -> None:
         session = self.get_session(user_id)
         session.project_dir = project_dir
-        session.session_id = None  # Reset session for new project
+        session.session_id = None
+        db.save_session(user_id, session)
 
     async def run(self, user_id: int, prompt: str) -> ClaudeResult:
         session = self.get_session(user_id)
@@ -110,6 +125,7 @@ class ClaudeRunner:
             session.message_count += 1
             session.total_cost += result.cost
             session.total_duration += result.duration
+            db.save_session(user_id, session)
             return result
 
         except asyncio.TimeoutError:
@@ -120,7 +136,7 @@ class ClaudeRunner:
             logger.exception("Claude runner error")
             return ClaudeResult(text=f"Error: {e}", is_error=True)
 
-    async def run_streaming(self, user_id: int, prompt: str, on_text) -> ClaudeResult:
+    async def run_streaming(self, user_id: int, prompt: str, on_text, on_tool=None) -> ClaudeResult:
         """Run Claude with streaming NDJSON output, calling on_text(accumulated) as text arrives."""
         session = self.get_session(user_id)
 
@@ -180,11 +196,12 @@ class ClaudeRunner:
                             await on_text(accumulated)
                     elif etype == "assistant":
                         msg = event.get("message", {})
-                        texts = [
-                            b["text"]
-                            for b in msg.get("content", [])
-                            if b.get("type") == "text"
-                        ]
+                        texts = []
+                        for block in msg.get("content", []):
+                            if block.get("type") == "text":
+                                texts.append(block["text"])
+                            elif block.get("type") == "tool_use" and on_tool:
+                                await on_tool(block.get("name", ""), block.get("input", {}))
                         if texts:
                             accumulated = "\n\n".join(texts)
                             await on_text(accumulated)
@@ -217,6 +234,7 @@ class ClaudeRunner:
             session.message_count += 1
             session.total_cost += result.cost
             session.total_duration += result.duration
+            db.save_session(user_id, session)
             return result
 
         except asyncio.TimeoutError:
