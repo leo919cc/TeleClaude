@@ -20,6 +20,19 @@ echo "Installing dependencies..."
 # Create logs dir
 mkdir -p "$PROJECT_DIR/logs"
 
+# Build proxy env entries if present
+PROXY_ENTRIES=""
+if [ -n "${all_proxy:-}" ]; then
+    PROXY_ENTRIES="$PROXY_ENTRIES
+        <key>all_proxy</key>
+        <string>${all_proxy}</string>"
+fi
+if [ -n "${https_proxy:-}" ]; then
+    PROXY_ENTRIES="$PROXY_ENTRIES
+        <key>https_proxy</key>
+        <string>${https_proxy}</string>"
+fi
+
 # Generate plist with correct paths
 echo "Generating LaunchAgent plist..."
 cat > "$PLIST_DST" <<PLIST
@@ -52,7 +65,7 @@ cat > "$PLIST_DST" <<PLIST
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>${PROXY_ENTRIES}
     </dict>
 </dict>
 </plist>
