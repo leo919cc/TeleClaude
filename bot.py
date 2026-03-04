@@ -3,7 +3,7 @@
 import logging
 import os
 
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -222,6 +222,25 @@ def main():
         app.add_handler(CommandHandler(skill_name, cmd_skill))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    # Register command menu with Telegram
+    async def post_init(application):
+        commands = [
+            BotCommand("project", "Set working directory"),
+            BotCommand("projects", "List available projects"),
+            BotCommand("sync", "Pull latest, check tasks & status"),
+            BotCommand("wrap", "Commit, push, update tasks"),
+            BotCommand("review", "Self-review recent changes"),
+            BotCommand("backup", "Backup Claude settings to GitHub"),
+            BotCommand("note", "Save ideas to Notion"),
+            BotCommand("new", "Clear session"),
+            BotCommand("status", "Current session info"),
+            BotCommand("skills", "List all skills"),
+            BotCommand("help", "Show help"),
+        ]
+        await application.bot.set_my_commands(commands)
+        logger.info("Registered %d bot commands", len(commands))
+
+    app.post_init = post_init
     app.run_polling(drop_pending_updates=True)
 
 
