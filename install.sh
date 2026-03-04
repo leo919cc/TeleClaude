@@ -52,12 +52,7 @@ cat > "$PLIST_DST" <<PLIST
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-    <key>ThrottleInterval</key>
-    <integer>10</integer>
+    <false/>
     <key>StandardOutPath</key>
     <string>${PROJECT_DIR}/logs/stdout.log</string>
     <key>StandardErrorPath</key>
