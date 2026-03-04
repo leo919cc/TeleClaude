@@ -15,6 +15,7 @@ from telegram.request import HTTPXRequest
 
 from claude_runner import ClaudeRunner
 from config import ALLOWED_BASE, TELEGRAM_BOT_TOKEN, allowed_user_ids, validate
+from skills import SKILLS, get_skill_prompt, list_skills
 from utils import split_message
 
 logging.basicConfig(
@@ -45,13 +46,17 @@ def auth_check(func):
 
 @auth_check
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    skill_lines = "\n".join(f"/{name} — {info['description']}" for name, info in SKILLS.items())
     await update.message.reply_text(
         "Claude Code bridge ready.\n\n"
-        "Just send a message to talk to Claude.\n\n"
+        "Send a message to talk to Claude.\n\n"
+        "Session:\n"
         "/project <path> — set working directory\n"
         "/projects — list available projects\n"
         "/new — clear session\n"
-        "/status — current session info\n"
+        "/status — current session info\n\n"
+        f"Skills:\n{skill_lines}\n"
+        "/skills — list all skills\n\n"
         "/help — show this message"
     )
 
@@ -113,6 +118,53 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# --- Skill commands ---
+
+@auth_check
+async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(list_skills())
+
+
+@auth_check
+async def cmd_skill(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generic handler for skill commands like /sync, /wrap, /review, etc."""
+    command = update.message.text.split()[0].lstrip("/").split("@")[0]
+    args = " ".join(context.args) if context.args else ""
+    skill_info = SKILLS.get(command)
+
+    if not skill_info:
+        await update.message.reply_text(f"Unknown skill: /{command}\n\n{list_skills()}")
+        return
+
+    if skill_info.get("needs_project"):
+        session = runner.get_session(update.effective_user.id)
+        if not session.project_dir:
+            await update.message.reply_text(
+                f"/{command} requires a project. Set one first:\n/project <path>"
+            )
+            return
+
+    prompt = get_skill_prompt(command, args)
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+
+    result = await runner.run(update.effective_user.id, prompt)
+
+    if result.session_id:
+        session = runner.get_session(update.effective_user.id)
+        session.session_id = result.session_id
+
+    footer_parts = []
+    if result.cost:
+        footer_parts.append(f"${result.cost:.4f}")
+    if result.duration:
+        footer_parts.append(f"{result.duration:.1f}s")
+    footer = f"\n\n[{' · '.join(footer_parts)}]" if footer_parts else ""
+
+    text = result.text + footer
+    for chunk in split_message(text):
+        await update.message.reply_text(chunk)
+
+
 # --- Message handler ---
 
 @auth_check
@@ -165,6 +217,9 @@ def main():
     app.add_handler(CommandHandler("projects", cmd_projects))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("skills", cmd_skills))
+    for skill_name in SKILLS:
+        app.add_handler(CommandHandler(skill_name, cmd_skill))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     app.run_polling(drop_pending_updates=True)
