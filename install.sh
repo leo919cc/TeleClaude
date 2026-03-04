@@ -44,8 +44,8 @@ cat > "$PLIST_DST" <<PLIST
     <string>com.claude-tg-bridge</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${VENV_PYTHON}</string>
-        <string>${PROJECT_DIR}/bot.py</string>
+        <string>/bin/bash</string>
+        <string>${PROJECT_DIR}/run.sh</string>
     </array>
     <key>WorkingDirectory</key>
     <string>${PROJECT_DIR}</string>
@@ -65,7 +65,9 @@ cat > "$PLIST_DST" <<PLIST
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>${PROXY_ENTRIES}
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>${PROXY_ENTRIES}
     </dict>
 </dict>
 </plist>

@@ -51,8 +51,12 @@ class ClaudeRunner:
         if session.session_id:
             cmd.extend(["--resume", session.session_id])
 
-        # Clean env: remove CLAUDECODE to avoid nested session detection
+        # Build env: ensure HOME/USER are set (LaunchAgent has minimal env),
+        # and remove CLAUDECODE to avoid nested session detection
         env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        env.setdefault("HOME", str(Path.home()))
+        env.setdefault("USER", os.getlogin())
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
         cwd = None
         if session.project_dir:
             cwd = str(session.project_dir)
@@ -74,14 +78,21 @@ class ClaudeRunner:
                 timeout=CLAUDE_TIMEOUT,
             )
 
+            raw_out = stdout.decode().strip()
+            raw_err = stderr.decode().strip()
+            logger.info("claude exit=%d, stdout=%d bytes, stderr=%d bytes", proc.returncode, len(raw_out), len(raw_err))
+            if raw_err:
+                logger.warning("claude stderr: %s", raw_err[:500])
+
             if proc.returncode != 0:
-                err = stderr.decode().strip() or stdout.decode().strip()
+                err = raw_err or raw_out
                 return ClaudeResult(text=f"Error (exit {proc.returncode}):\n{err}", is_error=True)
 
-            return self._parse_output(stdout.decode())
+            return self._parse_output(raw_out)
 
         except asyncio.TimeoutError:
             proc.kill()
+            logger.error("claude timed out after %ds", CLAUDE_TIMEOUT)
             return ClaudeResult(text="Timed out (5 min limit).", is_error=True)
         except Exception as e:
             logger.exception("Claude runner error")

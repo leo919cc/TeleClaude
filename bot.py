@@ -1,7 +1,7 @@
 """Telegram → Claude Code bridge bot."""
 
 import logging
-from pathlib import Path
+import os
 
 from telegram import Update
 from telegram.ext import (
@@ -11,6 +11,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from claude_runner import ClaudeRunner
 from config import ALLOWED_BASE, TELEGRAM_BOT_TOKEN, allowed_user_ids, validate
@@ -150,7 +151,13 @@ def main():
     validate()
     logger.info("Starting Claude TG bridge...")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # Explicitly set proxy for httpx if available (env vars alone are unreliable)
+    proxy = os.environ.get("all_proxy") or os.environ.get("ALL_PROXY")
+    builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
+    if proxy:
+        logger.info("Using proxy: %s", proxy)
+        builder = builder.proxy(proxy).get_updates_proxy(proxy)
+    app = builder.build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
