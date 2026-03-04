@@ -1,14 +1,18 @@
 """Telegram → Claude Code bridge bot."""
 
+import asyncio
 import html
 import json
 import logging
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 
+import httpx
 from telegram import BotCommand, Update
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -16,10 +20,10 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telegram.request import HTTPXRequest
 
 from claude_runner import ClaudeRunner
-from config import ALLOWED_BASE, TELEGRAM_BOT_TOKEN, allowed_user_ids, validate
+from config import ALLOWED_BASE, GROQ_API_KEY, TELEGRAM_BOT_TOKEN, allowed_user_ids, validate
+from scheduler import Scheduler
 from skills import SKILLS, get_skill_prompt, list_skills
 from utils import detect_created_files, markdown_to_tg_html, split_message
 
@@ -30,6 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 runner = ClaudeRunner()
+scheduler_instance: Scheduler | None = None
 
 
 # --- Auth ---
@@ -98,6 +103,110 @@ async def send_detected_files(message, files: list[Path]):
             await message.reply_text(f"Could not send {fp.name}: {e}")
 
 
+# --- Streaming ---
+
+class StreamingMessage:
+    """Progressive Telegram message updates during Claude streaming."""
+
+    INTERVAL = 1.5  # seconds between edits
+    MAX_CHUNK = 4000  # leave room for cursor/formatting
+
+    def __init__(self, chat_id: int, bot):
+        self.chat_id = chat_id
+        self.bot = bot
+        self.msg = None
+        self.sent_len = 0  # chars sealed in previous messages
+        self.last_edit = 0.0
+
+    async def update(self, full_text: str):
+        """Called with accumulated text. Edits the Telegram message at most every INTERVAL."""
+        current = full_text[self.sent_len:]
+        if not current.strip():
+            return
+
+        now = time.time()
+
+        if self.msg is None:
+            self.msg = await self.bot.send_message(self.chat_id, current[:self.MAX_CHUNK] + " ...")
+            self.last_edit = now
+            return
+
+        # Split if current chunk is too long
+        if len(current) > self.MAX_CHUNK:
+            seal_point = current.rfind("\n", 0, self.MAX_CHUNK)
+            if seal_point < self.MAX_CHUNK // 2:
+                seal_point = self.MAX_CHUNK
+            try:
+                await self.msg.edit_text(current[:seal_point])
+            except (BadRequest, RetryAfter):
+                pass
+            self.sent_len += seal_point
+            remainder = current[seal_point:]
+            self.msg = await self.bot.send_message(self.chat_id, remainder + " ...")
+            self.last_edit = now
+            return
+
+        if now - self.last_edit < self.INTERVAL:
+            return
+
+        try:
+            await self.msg.edit_text(current + " ...")
+            self.last_edit = now
+        except BadRequest:
+            pass  # message not modified
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+
+    async def finalize(self, full_text: str, footer: str = ""):
+        """Replace last message with HTML-formatted version + footer."""
+        current = full_text[self.sent_len:]
+        formatted = markdown_to_tg_html(current + footer)
+        chunks = split_message(formatted)
+
+        if self.msg is None:
+            for chunk in chunks:
+                try:
+                    await self.bot.send_message(self.chat_id, chunk, parse_mode="HTML")
+                except Exception:
+                    plain = html.unescape(re.sub(r"<[^>]+>", "", chunk))
+                    await self.bot.send_message(self.chat_id, plain)
+            return
+
+        # Edit current message with first chunk
+        try:
+            await self.msg.edit_text(chunks[0], parse_mode="HTML")
+        except Exception:
+            try:
+                plain = html.unescape(re.sub(r"<[^>]+>", "", chunks[0]))
+                await self.msg.edit_text(plain)
+            except Exception:
+                pass
+
+        # Send remaining chunks as new messages
+        for chunk in chunks[1:]:
+            try:
+                await self.bot.send_message(self.chat_id, chunk, parse_mode="HTML")
+            except Exception:
+                plain = html.unescape(re.sub(r"<[^>]+>", "", chunk))
+                await self.bot.send_message(self.chat_id, plain)
+
+
+# --- Voice ---
+
+async def transcribe_voice(audio_path: Path) -> str:
+    """Transcribe audio via Groq Whisper API."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            files={"file": ("audio.ogg", open(audio_path, "rb"), "audio/ogg")},
+            data={"model": "whisper-large-v3"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()["text"]
+
+
 # --- Commands ---
 
 @auth_check
@@ -105,12 +214,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     skill_lines = "\n".join(f"/{name} — {info['description']}" for name, info in SKILLS.items())
     await update.message.reply_text(
         "Claude Code bridge ready.\n\n"
-        "Send a message to talk to Claude.\n\n"
+        "Send a message or voice note to talk to Claude.\n\n"
         "Session:\n"
         "/project <path> — set working directory\n"
         "/projects — list available projects\n"
         "/new — clear session\n"
-        "/status — current session info\n\n"
+        "/status — current session info\n"
+        "/permissions — toggle permission mode\n\n"
+        "Scheduling:\n"
+        "/schedule — schedule a recurring prompt\n"
+        "/jobs — list scheduled jobs\n"
+        "/canceljob — cancel a job\n\n"
         f"Skills:\n{skill_lines}\n"
         "/skills — list all skills\n\n"
         "/help — show this message"
@@ -268,6 +382,74 @@ async def cmd_getfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# --- Permissions ---
+
+@auth_check
+async def cmd_permissions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    session = runner.get_session(update.effective_user.id)
+    if session.permission_mode == "bypassPermissions":
+        session.permission_mode = "acceptEdits"
+        await update.message.reply_text("Mode: acceptEdits (safe — edits only)")
+    else:
+        session.permission_mode = "bypassPermissions"
+        await update.message.reply_text("Mode: bypassPermissions (full access)")
+
+
+# --- Scheduling ---
+
+@auth_check
+async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or len(context.args) < 6:
+        await update.message.reply_text(
+            "Usage: /schedule <min> <hr> <day> <mon> <dow> <prompt>\n"
+            "Example: /schedule */5 * * * * check disk usage"
+        )
+        return
+
+    cron = " ".join(context.args[:5])
+    prompt = " ".join(context.args[5:])
+    session = runner.get_session(update.effective_user.id)
+    project_dir = str(session.project_dir) if session.project_dir else None
+
+    try:
+        job = scheduler_instance.add(
+            cron=cron,
+            prompt=prompt,
+            chat_id=update.effective_chat.id,
+            user_id=update.effective_user.id,
+            project_dir=project_dir,
+        )
+        await update.message.reply_text(f"Scheduled [{job.id}]: {cron}\n{prompt}")
+    except Exception as e:
+        await update.message.reply_text(f"Invalid schedule: {e}")
+
+
+@auth_check
+async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    jobs = scheduler_instance.list_jobs(update.effective_user.id)
+    if not jobs:
+        await update.message.reply_text("No scheduled jobs.")
+        return
+
+    lines = []
+    for j in jobs:
+        lines.append(f"[{j.id}] {j.cron}  {j.prompt[:60]}")
+    await update.message.reply_text("Scheduled jobs:\n" + "\n".join(lines))
+
+
+@auth_check
+async def cmd_canceljob(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /canceljob <id>")
+        return
+
+    job_id = context.args[0]
+    if scheduler_instance.remove(job_id):
+        await update.message.reply_text(f"Cancelled job {job_id}.")
+    else:
+        await update.message.reply_text(f"Job {job_id} not found.")
+
+
 # --- Skill commands ---
 
 @auth_check
@@ -311,8 +493,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
-    result = await runner.run(update.effective_user.id, prompt)
-    await _send_result(update, result)
+    streamer = StreamingMessage(update.effective_chat.id, context.bot)
+    result = await runner.run_streaming(update.effective_user.id, prompt, streamer.update)
+    await _send_streaming_result(update, streamer, result)
 
 
 # --- Media handlers ---
@@ -385,6 +568,41 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path.unlink(missing_ok=True)
 
 
+# --- Voice handler ---
+
+@auth_check
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle voice messages — transcribe via Groq Whisper, then send to Claude."""
+    voice = update.message.voice or update.message.audio
+    if not voice:
+        return
+
+    if not GROQ_API_KEY:
+        await update.message.reply_text("Voice not configured — set GROQ_API_KEY.")
+        return
+
+    MEDIA_DIR.mkdir(exist_ok=True)
+    file = await context.bot.get_file(voice.file_id)
+    path = MEDIA_DIR / f"{voice.file_unique_id}.ogg"
+    await file.download_to_drive(path)
+
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+
+    try:
+        text = await transcribe_voice(path)
+    except Exception as e:
+        await update.message.reply_text(f"Transcription failed: {e}")
+        return
+    finally:
+        path.unlink(missing_ok=True)
+
+    await update.message.reply_text(f"Transcription: {text}")
+
+    streamer = StreamingMessage(update.effective_chat.id, context.bot)
+    result = await runner.run_streaming(update.effective_user.id, text, streamer.update)
+    await _send_streaming_result(update, streamer, result)
+
+
 async def _send_result(update: Update, result):
     """Send a ClaudeResult back to the user with formatting, files, etc."""
     user_id = update.effective_user.id
@@ -406,6 +624,38 @@ async def _send_result(update: Update, result):
 
     # Send formatted text
     await send_reply(update.message, text)
+
+    # Auto-attach as .md if response looks like a document
+    if _looks_like_document(result.text):
+        await send_as_file(update.message, result.text, "document.md")
+
+    # Auto-send files created during this run
+    if result.run_started:
+        session = runner.get_session(user_id)
+        files = detect_created_files(
+            result.text, session.project_dir, result.run_started
+        )
+        if files:
+            await send_detected_files(update.message, files)
+
+
+async def _send_streaming_result(update: Update, streamer: StreamingMessage, result):
+    """Finalize a streaming response — format, footer, files."""
+    user_id = update.effective_user.id
+
+    if result.session_id:
+        session = runner.get_session(user_id)
+        session.session_id = result.session_id
+
+    # Build footer
+    footer_parts = []
+    if result.cost:
+        footer_parts.append(f"${result.cost:.4f}")
+    if result.duration:
+        footer_parts.append(f"{result.duration:.1f}s")
+    footer = f"\n\n[{' · '.join(footer_parts)}]" if footer_parts else ""
+
+    await streamer.finalize(result.text, footer)
 
     # Auto-attach as .md if response looks like a document
     if _looks_like_document(result.text):
@@ -445,15 +695,24 @@ def main():
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("config", cmd_config))
     app.add_handler(CommandHandler("getfile", cmd_getfile))
+    app.add_handler(CommandHandler("permissions", cmd_permissions))
+    app.add_handler(CommandHandler("schedule", cmd_schedule))
+    app.add_handler(CommandHandler("jobs", cmd_jobs))
+    app.add_handler(CommandHandler("canceljob", cmd_canceljob))
     app.add_handler(CommandHandler("skills", cmd_skills))
     for skill_name in SKILLS:
         app.add_handler(CommandHandler(skill_name, cmd_skill))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     # Register command menu with Telegram (max 100 commands)
     async def post_init(application):
+        global scheduler_instance
+        scheduler_instance = Scheduler(runner, application.bot)
+        scheduler_instance.start()
+
         commands = [
             BotCommand("project", "Set working directory"),
             BotCommand("projects", "List available projects"),
@@ -461,6 +720,10 @@ def main():
             BotCommand("status", "Current session info"),
             BotCommand("cost", "Session cost & usage"),
             BotCommand("model", "Switch AI model"),
+            BotCommand("permissions", "Toggle permission mode"),
+            BotCommand("schedule", "Schedule a recurring prompt"),
+            BotCommand("jobs", "List scheduled jobs"),
+            BotCommand("canceljob", "Cancel a scheduled job"),
             BotCommand("config", "View Claude settings"),
             BotCommand("getfile", "Download a file"),
         ]

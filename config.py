@@ -15,6 +15,7 @@ TELEGRAM_USER_ID = os.getenv("TELEGRAM_USER_ID")
 CLAUDE_PATH = os.getenv("CLAUDE_PATH", "/opt/homebrew/bin/claude")
 ALLOWED_BASE = Path(os.getenv("ALLOWED_BASE", str(Path.home() / "Documents")))
 CLAUDE_TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "300"))  # 5 min
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 
 def validate():

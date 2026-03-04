@@ -21,6 +21,7 @@ class Session:
     project_dir: Path | None = None
     session_id: str | None = None
     model: str | None = None
+    permission_mode: str = "bypassPermissions"
     total_cost: float = 0.0
     total_duration: float = 0.0
     message_count: int = 0
@@ -57,6 +58,7 @@ class ClaudeRunner:
         session = self.get_session(user_id)
 
         cmd = [CLAUDE_PATH, "-p", "--output-format", "json"]
+        cmd.extend(["--permission-mode", session.permission_mode])
         # Allow Claude to read files from the media temp directory
         if MEDIA_DIR.is_dir():
             cmd.extend(["--add-dir", str(MEDIA_DIR)])
@@ -116,6 +118,115 @@ class ClaudeRunner:
             return ClaudeResult(text="Timed out (5 min limit).", is_error=True)
         except Exception as e:
             logger.exception("Claude runner error")
+            return ClaudeResult(text=f"Error: {e}", is_error=True)
+
+    async def run_streaming(self, user_id: int, prompt: str, on_text) -> ClaudeResult:
+        """Run Claude with streaming NDJSON output, calling on_text(accumulated) as text arrives."""
+        session = self.get_session(user_id)
+
+        cmd = [CLAUDE_PATH, "-p", "--output-format", "stream-json", "--verbose"]
+        cmd.extend(["--permission-mode", session.permission_mode])
+        if MEDIA_DIR.is_dir():
+            cmd.extend(["--add-dir", str(MEDIA_DIR)])
+        if session.model:
+            cmd.extend(["--model", session.model])
+        if session.session_id:
+            cmd.extend(["--resume", session.session_id])
+
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        env.setdefault("HOME", str(Path.home()))
+        env.setdefault("USER", os.getlogin())
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+        cwd = str(session.project_dir) if session.project_dir else None
+
+        logger.info("Streaming: %s (cwd=%s)", " ".join(cmd[:6]), cwd)
+        run_started = time.time()
+        accumulated = ""
+        cost = 0.0
+        duration = 0.0
+        session_id = None
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                env=env,
+            )
+
+            proc.stdin.write(prompt.encode())
+            await proc.stdin.drain()
+            proc.stdin.close()
+
+            async def _read_stream():
+                nonlocal accumulated, cost, duration, session_id
+                async for raw_line in proc.stdout:
+                    line = raw_line.decode().strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    etype = event.get("type")
+
+                    if etype == "content_block_delta":
+                        delta = event.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            accumulated += delta.get("text", "")
+                            await on_text(accumulated)
+                    elif etype == "assistant":
+                        msg = event.get("message", {})
+                        texts = [
+                            b["text"]
+                            for b in msg.get("content", [])
+                            if b.get("type") == "text"
+                        ]
+                        if texts:
+                            accumulated = "\n\n".join(texts)
+                            await on_text(accumulated)
+                    elif etype == "result":
+                        result_text = event.get("result", "")
+                        if result_text:
+                            accumulated = result_text
+                        cost = event.get("cost_usd", 0.0) or 0.0
+                        duration = (event.get("duration_ms", 0.0) or 0.0) / 1000
+                        session_id = event.get("session_id")
+
+                await proc.wait()
+
+            await asyncio.wait_for(_read_stream(), timeout=CLAUDE_TIMEOUT)
+
+            if proc.returncode != 0 and not accumulated:
+                stderr_data = await proc.stderr.read()
+                err = stderr_data.decode().strip()
+                return ClaudeResult(
+                    text=f"Error (exit {proc.returncode}):\n{err}", is_error=True
+                )
+
+            result = ClaudeResult(
+                text=accumulated or "No response.",
+                cost=cost,
+                duration=duration,
+                session_id=session_id,
+                run_started=run_started,
+            )
+            session.message_count += 1
+            session.total_cost += result.cost
+            session.total_duration += result.duration
+            return result
+
+        except asyncio.TimeoutError:
+            proc.kill()
+            logger.error("Streaming timed out after %ds", CLAUDE_TIMEOUT)
+            if accumulated:
+                return ClaudeResult(text=accumulated + "\n\n(timed out)", run_started=run_started)
+            return ClaudeResult(text="Timed out.", is_error=True)
+        except Exception as e:
+            logger.exception("Streaming error")
             return ClaudeResult(text=f"Error: {e}", is_error=True)
 
     def _parse_output(self, raw: str) -> ClaudeResult:
