@@ -95,6 +95,17 @@
 
 ---
 
+## Session Notes
+
+### 2026-03-04
+- Created phased feature roadmap from competitive analysis
+- Rewrote README with feature highlights, size comparison table, and credits
+- Pushed to GitHub as `leo919cc/TeleClaude`
+- Bot running natively via LaunchAgent on Mac mini
+- Next session: start Phase 1 (cancel, session list/pick, inline buttons)
+
+---
+
 ## Completed
 
 - [x] Text → Claude
