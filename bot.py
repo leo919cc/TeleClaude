@@ -1,8 +1,11 @@
 """Telegram → Claude Code bridge bot."""
 
+import html
 import json
 import logging
 import os
+import re
+import tempfile
 from pathlib import Path
 
 from telegram import BotCommand, Update
@@ -18,7 +21,7 @@ from telegram.request import HTTPXRequest
 from claude_runner import ClaudeRunner
 from config import ALLOWED_BASE, TELEGRAM_BOT_TOKEN, allowed_user_ids, validate
 from skills import SKILLS, get_skill_prompt, list_skills
-from utils import split_message
+from utils import detect_created_files, markdown_to_tg_html, split_message
 
 logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -42,6 +45,57 @@ def auth_check(func):
             return
         return await func(update, context)
     return wrapper
+
+
+# --- Reply helpers ---
+
+# Threshold for auto-attaching response as .md file
+DOC_THRESHOLD = 1500
+
+
+async def send_reply(message, text: str):
+    """Send reply with HTML formatting, falling back to plain text per chunk."""
+    formatted = markdown_to_tg_html(text)
+    for chunk in split_message(formatted):
+        try:
+            await message.reply_text(chunk, parse_mode="HTML")
+        except Exception:
+            # Strip HTML tags and send as plain text
+            plain = html.unescape(re.sub(r"<[^>]+>", "", chunk))
+            await message.reply_text(plain)
+
+
+def _looks_like_document(text: str) -> bool:
+    """Check if a response looks like a formatted document."""
+    headers = len(re.findall(r"^#{1,6}\s", text, re.MULTILINE))
+    return len(text) > DOC_THRESHOLD and headers >= 2
+
+
+async def send_as_file(message, text: str, filename: str = "response.md"):
+    """Send text as a .md file attachment."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".md", prefix="claude_", delete=False
+    ) as f:
+        f.write(text)
+        f.flush()
+        await message.reply_document(
+            document=open(f.name, "rb"),
+            filename=filename,
+            caption="Full document attached.",
+        )
+    os.unlink(f.name)
+
+
+async def send_detected_files(message, files: list[Path]):
+    """Send auto-detected files created by Claude."""
+    for fp in files[:5]:  # Cap at 5 files
+        try:
+            await message.reply_document(
+                document=open(fp, "rb"),
+                filename=fp.name,
+            )
+        except Exception as e:
+            await message.reply_text(f"Could not send {fp.name}: {e}")
 
 
 # --- Commands ---
@@ -178,6 +232,42 @@ async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error reading config: {e}")
 
 
+@auth_check
+async def cmd_getfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Download a file from the Mac Mini."""
+    if not context.args:
+        await update.message.reply_text("Usage: /getfile <path>\nExample: /getfile output/nda.md")
+        return
+
+    raw = " ".join(context.args)
+    path = Path(raw).expanduser()
+
+    # Resolve relative paths against project dir or ALLOWED_BASE
+    if not path.is_absolute():
+        session = runner.get_session(update.effective_user.id)
+        base = session.project_dir or ALLOWED_BASE
+        path = base / raw
+
+    path = path.resolve()
+
+    if not str(path).startswith(str(ALLOWED_BASE)):
+        await update.message.reply_text(f"Path must be under {ALLOWED_BASE}")
+        return
+
+    if not path.is_file():
+        await update.message.reply_text(f"Not found: {path}")
+        return
+
+    if path.stat().st_size > 20 * 1024 * 1024:
+        await update.message.reply_text("File too large (>20 MB).")
+        return
+
+    await update.message.reply_document(
+        document=open(path, "rb"),
+        filename=path.name,
+    )
+
+
 # --- Skill commands ---
 
 @auth_check
@@ -208,21 +298,7 @@ async def cmd_skill(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
     result = await runner.run(update.effective_user.id, prompt)
-
-    if result.session_id:
-        session = runner.get_session(update.effective_user.id)
-        session.session_id = result.session_id
-
-    footer_parts = []
-    if result.cost:
-        footer_parts.append(f"${result.cost:.4f}")
-    if result.duration:
-        footer_parts.append(f"{result.duration:.1f}s")
-    footer = f"\n\n[{' · '.join(footer_parts)}]" if footer_parts else ""
-
-    text = result.text + footer
-    for chunk in split_message(text):
-        await update.message.reply_text(chunk)
+    await _send_result(update, result)
 
 
 # --- Message handler ---
@@ -236,10 +312,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
     result = await runner.run(update.effective_user.id, prompt)
+    await _send_result(update, result)
 
-    # Persist session ID for continuity
+
+async def _send_result(update: Update, result):
+    """Send a ClaudeResult back to the user with formatting, files, etc."""
+    user_id = update.effective_user.id
+
+    # Persist session
     if result.session_id:
-        session = runner.get_session(update.effective_user.id)
+        session = runner.get_session(user_id)
         session.session_id = result.session_id
 
     # Build footer
@@ -251,10 +333,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     footer = f"\n\n[{' · '.join(footer_parts)}]" if footer_parts else ""
 
     text = result.text + footer
-    chunks = split_message(text)
 
-    for chunk in chunks:
-        await update.message.reply_text(chunk)
+    # Send formatted text
+    await send_reply(update.message, text)
+
+    # Auto-attach as .md if response looks like a document
+    if _looks_like_document(result.text):
+        await send_as_file(update.message, result.text, "document.md")
+
+    # Auto-send files created during this run
+    if result.run_started:
+        session = runner.get_session(user_id)
+        files = detect_created_files(
+            result.text, session.project_dir, result.run_started
+        )
+        if files:
+            await send_detected_files(update.message, files)
 
 
 # --- Main ---
@@ -280,6 +374,7 @@ def main():
     app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("config", cmd_config))
+    app.add_handler(CommandHandler("getfile", cmd_getfile))
     app.add_handler(CommandHandler("skills", cmd_skills))
     for skill_name in SKILLS:
         app.add_handler(CommandHandler(skill_name, cmd_skill))
@@ -295,6 +390,7 @@ def main():
             BotCommand("cost", "Session cost & usage"),
             BotCommand("model", "Switch AI model"),
             BotCommand("config", "View Claude settings"),
+            BotCommand("getfile", "Download a file"),
         ]
         # Add all skills to command menu
         for name, info in SKILLS.items():

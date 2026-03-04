@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,6 +30,7 @@ class ClaudeResult:
     duration: float = 0.0
     session_id: str | None = None
     is_error: bool = False
+    run_started: float = 0.0  # time.time() when the run started
 
 
 class ClaudeRunner:
@@ -68,6 +70,7 @@ class ClaudeRunner:
             cwd = str(session.project_dir)
 
         logger.info("Running: %s (cwd=%s)", " ".join(cmd[:4]), cwd)
+        run_started = time.time()
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -95,6 +98,7 @@ class ClaudeRunner:
                 return ClaudeResult(text=f"Error (exit {proc.returncode}):\n{err}", is_error=True)
 
             result = self._parse_output(raw_out)
+            result.run_started = run_started
             session.message_count += 1
             session.total_cost += result.cost
             session.total_duration += result.duration
