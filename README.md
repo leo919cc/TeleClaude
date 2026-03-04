@@ -10,6 +10,8 @@ I built TeleClaude because I wanted a dead-simple way to talk to Claude Code fro
 You (any device) → Telegram → TeleClaude (your machine) → claude -p → response back
 ```
 
+This is a personal tool I use daily. I'll keep adding features as I need them. It's highly personal, but I hope some of you find it useful.
+
 ## How It Works
 
 TeleClaude runs on your machine (Mac, Linux, wherever Claude Code is installed) and listens for Telegram messages. When you send a message, it spawns `claude -p` as a subprocess, streams the output, and sends the response back to your Telegram chat. That's it — no server, no database server, no Docker required.
