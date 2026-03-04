@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 class Session:
     project_dir: Path | None = None
     session_id: str | None = None
+    model: str | None = None
+    total_cost: float = 0.0
+    total_duration: float = 0.0
+    message_count: int = 0
 
 
 @dataclass
@@ -48,6 +52,8 @@ class ClaudeRunner:
         session = self.get_session(user_id)
 
         cmd = [CLAUDE_PATH, "-p", "--output-format", "json"]
+        if session.model:
+            cmd.extend(["--model", session.model])
         if session.session_id:
             cmd.extend(["--resume", session.session_id])
 
@@ -88,7 +94,11 @@ class ClaudeRunner:
                 err = raw_err or raw_out
                 return ClaudeResult(text=f"Error (exit {proc.returncode}):\n{err}", is_error=True)
 
-            return self._parse_output(raw_out)
+            result = self._parse_output(raw_out)
+            session.message_count += 1
+            session.total_cost += result.cost
+            session.total_duration += result.duration
+            return result
 
         except asyncio.TimeoutError:
             proc.kill()

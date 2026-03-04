@@ -1,7 +1,9 @@
 """Telegram → Claude Code bridge bot."""
 
+import json
 import logging
 import os
+from pathlib import Path
 
 from telegram import BotCommand, Update
 from telegram.ext import (
@@ -118,6 +120,64 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# --- Backend commands (reimplemented CLI commands) ---
+
+MODELS = {"sonnet", "opus", "haiku", "claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001"}
+
+
+@auth_check
+async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    session = runner.get_session(update.effective_user.id)
+    if session.message_count == 0:
+        await update.message.reply_text("No messages in this session yet.")
+        return
+    await update.message.reply_text(
+        f"Session cost: ${session.total_cost:.4f}\n"
+        f"Total time: {session.total_duration:.1f}s\n"
+        f"Messages: {session.message_count}"
+    )
+
+
+@auth_check
+async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    session = runner.get_session(update.effective_user.id)
+
+    if not context.args:
+        current = session.model or "default"
+        await update.message.reply_text(
+            f"Current model: {current}\n\n"
+            f"Usage: /model <name>\n"
+            f"Examples: /model opus, /model sonnet, /model haiku"
+        )
+        return
+
+    model = context.args[0].lower()
+    if model == "default":
+        session.model = None
+        await update.message.reply_text("Model reset to default.")
+        return
+
+    session.model = model
+    await update.message.reply_text(f"Model set to: {model}")
+
+
+@auth_check
+async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    config_path = Path.home() / ".claude" / "settings.json"
+    if not config_path.is_file():
+        await update.message.reply_text("No settings.json found.")
+        return
+
+    try:
+        data = json.loads(config_path.read_text())
+        text = json.dumps(data, indent=2)
+        if len(text) > 4000:
+            text = text[:4000] + "\n... (truncated)"
+        await update.message.reply_text(f"~/.claude/settings.json:\n\n{text}")
+    except Exception as e:
+        await update.message.reply_text(f"Error reading config: {e}")
+
+
 # --- Skill commands ---
 
 @auth_check
@@ -217,6 +277,9 @@ def main():
     app.add_handler(CommandHandler("projects", cmd_projects))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("cost", cmd_cost))
+    app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("config", cmd_config))
     app.add_handler(CommandHandler("skills", cmd_skills))
     for skill_name in SKILLS:
         app.add_handler(CommandHandler(skill_name, cmd_skill))
@@ -229,6 +292,9 @@ def main():
             BotCommand("projects", "List available projects"),
             BotCommand("new", "Clear session"),
             BotCommand("status", "Current session info"),
+            BotCommand("cost", "Session cost & usage"),
+            BotCommand("model", "Switch AI model"),
+            BotCommand("config", "View Claude settings"),
         ]
         # Add all skills to command menu
         for name, info in SKILLS.items():
