@@ -315,6 +315,76 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_result(update, result)
 
 
+# --- Media handlers ---
+
+MEDIA_DIR = Path(tempfile.gettempdir()) / "claude-tg-media"
+
+# Map Telegram MIME types to file extensions
+EXT_MAP = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "application/pdf": ".pdf",
+    "text/plain": ".txt",
+    "application/json": ".json",
+    "text/csv": ".csv",
+}
+
+
+@auth_check
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle photos sent to the bot — download and ask Claude to analyze."""
+    photo = update.message.photo[-1]  # Highest resolution
+    caption = update.message.caption or "Describe and analyze this image."
+
+    MEDIA_DIR.mkdir(exist_ok=True)
+    file = await context.bot.get_file(photo.file_id)
+    path = MEDIA_DIR / f"{photo.file_unique_id}.jpg"
+    await file.download_to_drive(path)
+
+    prompt = (
+        f"Read the image at {path} using your Read tool, then respond to this request:\n\n"
+        f"{caption}"
+    )
+
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    result = await runner.run(update.effective_user.id, prompt)
+    await _send_result(update, result)
+
+    # Clean up
+    path.unlink(missing_ok=True)
+
+
+@auth_check
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle documents (PDFs, text files, etc.) sent to the bot."""
+    doc = update.message.document
+    caption = update.message.caption or f"Read and analyze this file: {doc.file_name}"
+
+    # Determine extension
+    ext = Path(doc.file_name).suffix if doc.file_name else EXT_MAP.get(doc.mime_type, "")
+    if not ext:
+        await update.message.reply_text(f"Unsupported file type: {doc.mime_type}")
+        return
+
+    MEDIA_DIR.mkdir(exist_ok=True)
+    file = await context.bot.get_file(doc.file_id)
+    path = MEDIA_DIR / f"{doc.file_unique_id}{ext}"
+    await file.download_to_drive(path)
+
+    prompt = (
+        f"Read the file at {path} using your Read tool, then respond to this request:\n\n"
+        f"{caption}"
+    )
+
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    result = await runner.run(update.effective_user.id, prompt)
+    await _send_result(update, result)
+
+    path.unlink(missing_ok=True)
+
+
 async def _send_result(update: Update, result):
     """Send a ClaudeResult back to the user with formatting, files, etc."""
     user_id = update.effective_user.id
@@ -379,6 +449,8 @@ def main():
     for skill_name in SKILLS:
         app.add_handler(CommandHandler(skill_name, cmd_skill))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     # Register command menu with Telegram (max 100 commands)
     async def post_init(application):

@@ -4,11 +4,14 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from config import CLAUDE_PATH, CLAUDE_TIMEOUT
+
+MEDIA_DIR = Path(tempfile.gettempdir()) / "claude-tg-media"
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +57,9 @@ class ClaudeRunner:
         session = self.get_session(user_id)
 
         cmd = [CLAUDE_PATH, "-p", "--output-format", "json"]
+        # Allow Claude to read files from the media temp directory
+        if MEDIA_DIR.is_dir():
+            cmd.extend(["--add-dir", str(MEDIA_DIR)])
         if session.model:
             cmd.extend(["--model", session.model])
         if session.session_id:
